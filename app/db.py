@@ -108,6 +108,25 @@ CREATE TABLE IF NOT EXISTS dossier_item (
     UNIQUE (dossier_pk, sample_code)
 );
 
+-- 人员标识登记（质控回避用）：人员标识 person_id 全局唯一，可登记多个历史别名；
+-- 别名全局唯一——不得归属多人，也不得转移归属（行只追加，不更新/不复用）。
+-- revision 为修订号：创建为 1，每次增补别名成功 +1；增补须携带所见修订号，过期拒绝。
+CREATE TABLE IF NOT EXISTS person (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id   TEXT NOT NULL UNIQUE,                -- 人员标识（业务唯一键）
+    revision    INTEGER NOT NULL,                    -- 修订号（创建=1，每次增补别名 +1）
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS person_alias (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_pk   INTEGER NOT NULL REFERENCES person(id),
+    alias       TEXT NOT NULL UNIQUE,                -- 别名全局唯一：不得归属多人或转移归属
+    is_primary  INTEGER NOT NULL,                    -- 1=登记人员时的首个别名，0=后续增补
+    created_at  TEXT NOT NULL
+);
+
 -- 案卷双人独立复核（质控）：一个案卷对应一个复核案；前两份为两名不同复核人的
 -- 完整清单（seq 1/2，kind=review），有分歧的份项再由未参与前两次复核的第三人
 -- 裁决（seq 3，kind=adjudication，仅含分歧份项）。意见提交后不可改。
@@ -126,7 +145,10 @@ CREATE TABLE IF NOT EXISTS review (
     review_no     TEXT NOT NULL UNIQUE,                -- 全局唯一复核单号（同号重试幂等/异内容冲突）
     seq           INTEGER NOT NULL,                    -- 提交次序：1/2 独立复核，3 第三人裁决
     kind          TEXT NOT NULL CHECK (kind IN ('review','adjudication')),
-    reviewer      TEXT NOT NULL,                       -- 复核人标识（前两份须不同，第三人须未参与前两次）
+    reviewer      TEXT NOT NULL,                       -- 提交时使用的标识原字符串
+    reviewer_person_pk INTEGER,                        -- 提交时解析到的人员行（未登记为 NULL，事后不追溯改写）
+    reviewer_person_id TEXT,                           -- 提交时使用的身份归属人员标识（未登记为 NULL）
+    reviewer_matched_alias TEXT,                       -- 命中的已登记别名（按原字符串直接登记时等于该字符串；未登记为 NULL）
     request_hash  TEXT NOT NULL,                       -- 请求指纹（同复核单号幂等/冲突判定）
     created_at    TEXT NOT NULL,
     UNIQUE (case_pk, seq),
@@ -157,6 +179,7 @@ POST_MIGRATION_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_event_batch ON custody_event(batch_id)",
     "CREATE INDEX IF NOT EXISTS idx_batch_item_batch ON transfer_batch_item(batch_pk, item_index)",
     "CREATE INDEX IF NOT EXISTS idx_dossier_item_dossier ON dossier_item(dossier_pk, item_index)",
+    "CREATE INDEX IF NOT EXISTS idx_person_alias_person ON person_alias(person_pk, id)",
 ]
 
 # 旧库增量补列
@@ -165,6 +188,12 @@ _MIGRATION_COLUMNS = {
         ("superseded_by", "TEXT"),
         ("replaces_event_id", "TEXT"),
         ("batch_id", "TEXT"),
+    ],
+    # 已提交意见固化当时使用的身份归属；旧复核行保持 NULL（不伪造身份记录、不追溯改写）
+    "review": [
+        ("reviewer_person_pk", "INTEGER"),
+        ("reviewer_person_id", "TEXT"),
+        ("reviewer_matched_alias", "TEXT"),
     ],
 }
 

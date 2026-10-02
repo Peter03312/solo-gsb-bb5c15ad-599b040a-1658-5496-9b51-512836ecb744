@@ -184,6 +184,50 @@ class DossierIn(BaseModel):
     items: list[DossierItemIn] = Field(..., min_length=2, description="卷内样本（至少两份，编号不重复）")
 
 
+class PersonIn(BaseModel):
+    """人员标识登记：一个人员标识携带一个或多个起始别名（历史别名册）。
+
+    * person_id 全局唯一；别名全局唯一——不得归属多人，也不得转移归属；
+    * 同 person_id 且别名集合完全一致的重试幂等（200）；异内容 → 409 person_conflict；
+    * 起始别名已归属他人 → 409 alias_conflict，整单不留人员/别名。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    person_id: str = Field(..., min_length=1, description="人员标识（业务唯一键，如工号）")
+    aliases: list[str] = Field(..., min_length=1, description="起始别名列表（至少一个；自动去重，均为非空字符串）")
+
+    @model_validator(mode="after")
+    def _check_aliases_nonblank(self) -> "PersonIn":
+        cleaned = [a.strip() for a in self.aliases]
+        if any(not a for a in cleaned):
+            raise ValueError("别名不得为空字符串")
+        self.aliases = cleaned
+        return self
+
+
+class AliasAddIn(BaseModel):
+    """为已登记人员增补一个历史别名（别名只追加、不转移、不复用）。
+
+    * expected_revision 为提交方所见修订号（GET /persons/{id} 取得的 revision，
+      创建人员时 revision=1），与当前修订号不一致 → 409 person_revision_stale；
+    * 别名已归属任何人（含本人重复增补）→ 409 alias_conflict；
+    * 增补成功后该人员 revision +1。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    alias: str = Field(..., min_length=1, description="增补的历史别名（全局唯一，不得归属多人或转移）")
+    expected_revision: int = Field(..., ge=1, description="提交方所见修订号（乐观并发控制，过期拒绝）")
+
+    @model_validator(mode="after")
+    def _check_alias_nonblank(self) -> "AliasAddIn":
+        self.alias = self.alias.strip()
+        if not self.alias:
+            raise ValueError("别名不得为空字符串")
+        return self
+
+
 class ReviewItemIn(BaseModel):
     """案卷复核清单中的一份意见：卷内样本编号 + 通过/不通过 + 不通过原因。
 

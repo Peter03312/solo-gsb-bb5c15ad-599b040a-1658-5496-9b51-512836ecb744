@@ -12,6 +12,13 @@
   5. 全部份项终局后形成案卷终局结论：任一份终局不通过则案卷不通过；
      终局在全部份项终局的那次提交内一次性固化，此后拒绝一切提交（越阶段）。
 
+质控回避（identities 模块）：每次提交在事务内读取【当前别名归属册】解析复核人
+身份，按封存版本快照（采集人、有效事件移交交出/接收人与签收人、核定人）对照
+复核人及其别名。前两次按案卷全部份项、第三人按分歧份项；命中任一份项即在写入前
+抛 422 review_conflict_of_interest（不留记录、不占复核单号）。两人互异与第三人
+资格同样按提交时归属判定；成功提交把当时身份归属固化到 review 行，后续增补别名
+不追溯改变已提交意见（未登记者固化为 NULL，旧意见不伪造身份）。
+
 幂等 / 并发 / 原子：
   * 同复核单号同内容重试 → 幂等返回原结果（200）；同复核单号异内容 → 409 review_conflict；
   * 全部校验先于任何写入，失败不留下部分记录；
@@ -23,6 +30,7 @@ import sqlite3
 from typing import Any
 
 from .db import utcnow_iso
+from .identities import Identity, alias_map, conflict_of_interest_hits, resolve_name
 from .schemas import ReviewIn
 from .service import DomainError, _fingerprint
 
@@ -68,6 +76,71 @@ def _dossier_items(conn: sqlite3.Connection, dossier_pk: int) -> list[sqlite3.Ro
         "SELECT * FROM dossier_item WHERE dossier_pk = ? ORDER BY item_index ASC",
         (dossier_pk,),
     ).fetchall()
+
+
+def _snapshot_map(item_rows: list[sqlite3.Row]) -> dict[int, dict[str, Any]]:
+    """封存清单 item_index → 该份封存版本完整快照（回避检查依据封存快照）。"""
+    return {it["item_index"]: json.loads(it["snapshot_json"]) for it in item_rows}
+
+
+def _reviewer_identity_block(ident: Identity) -> dict[str, Any]:
+    """成功提交时固化的身份归属（写入 review 行并在查询中原样展示）。"""
+    return {
+        "reviewer_person_pk": ident.person_pk,
+        "reviewer_person_id": ident.person_id,
+        "reviewer_matched_alias": ident.matched_alias,
+    }
+
+
+def _identity_view(review_row: sqlite3.Row) -> dict[str, Any]:
+    """查询时展示提交当时使用的身份归属。
+
+    旧库迁移而来的复核行身份列为 NULL——旧意见不伪造身份记录，仅按原字符串展示；
+    后续增补别名不追溯改变已提交意见。
+    """
+    return {
+        "name": review_row["reviewer"],
+        "person_id": review_row["reviewer_person_id"],
+        "registered": review_row["reviewer_person_id"] is not None,
+        "matched_alias": review_row["reviewer_matched_alias"],
+    }
+
+
+def _enforce_conflict_of_interest(
+    data: ReviewIn,
+    reviewer: Identity,
+    aliases: dict[str, Identity],
+    item_rows: list[sqlite3.Row],
+    scope_codes: set[str] | None,
+    *,
+    kind: str,
+    dossier_id: str,
+) -> None:
+    """质控回避检查：命中任一份项即整单拒绝（422 review_conflict_of_interest）。
+
+    前两次独立复核按封存案卷【全部份项】；第三人裁决按【分歧份项】。
+    在提交事务内以封存版本快照中的采集人、有效事件移交/签收参与人、核定人
+    对照复核人及其当前别名归属判定；失败先于任何写入，不占用复核单号。
+    """
+    snapshots = _snapshot_map(item_rows)
+    if scope_codes is not None:
+        snapshots = {
+            idx: snap for idx, snap in snapshots.items()
+            if snap["sample"]["sample_code"] in scope_codes
+        }
+    hits = conflict_of_interest_hits(reviewer, aliases, snapshots)
+    if hits:
+        raise DomainError(
+            422,
+            "review_conflict_of_interest",
+            "复核人参与过相关样本保管（采集/移交/签收/核定），不得评价自己参与的案卷，"
+            "命中份项整单拒绝且不占用复核单号",
+            {"dossier_id": dossier_id,
+             "submission_kind": kind,
+             "reviewer": reviewer.as_dict(),
+             "scope": "all_items" if kind == "review" else "disputed_items",
+             "items": hits},
+        )
 
 
 def _existing_reviews(conn: sqlite3.Connection, case_pk: int) -> list[sqlite3.Row]:
@@ -137,6 +210,7 @@ def _item_decisions(
                 "kind": rv["kind"],
                 "review_no": rv["review_no"],
                 "reviewer": rv["reviewer"],
+                "reviewer_identity": _identity_view(rv),
                 "passed": bool(row["passed"]),
                 "reason": row["reason"],
                 "submitted_at": rv["created_at"],
@@ -259,6 +333,7 @@ def build_case_view(conn: sqlite3.Connection, dossier: sqlite3.Row, case_row: sq
         "all_items_final": all_final,
         "reviewers": [
             {"seq": r["seq"], "kind": r["kind"], "reviewer": r["reviewer"],
+             "reviewer_identity": _identity_view(r),
              "review_no": r["review_no"], "submitted_at": r["created_at"]}
             for r in reviews
         ],
@@ -275,6 +350,7 @@ def _submission_view(review_row: sqlite3.Row, opinions: list[sqlite3.Row]) -> di
         "seq": review_row["seq"],
         "kind": review_row["kind"],
         "reviewer": review_row["reviewer"],
+        "reviewer_identity": _identity_view(review_row),
         "submitted_at": review_row["created_at"],
         "items": [
             {"sample_code": o["sample_code"], "passed": bool(o["passed"]), "reason": o["reason"]}
@@ -356,6 +432,40 @@ def _validate_adjudication_list(
 
 # --------------------------------------------------------------------------- 提交
 
+def _find_duplicate_reviewer(
+    conn: sqlite3.Connection,
+    aliases: dict[str, Identity],
+    current: Identity,
+    prior_rows: list[sqlite3.Row],
+) -> dict[str, Any] | None:
+    """判定当前提交人是否与前序提交人为同一人（资格按本次提交时的别名归属）。
+
+    * 前序意见固化了提交当时身份归属：双方均已登记且归属人员相同 → 同人；
+      旧意见（身份列为 NULL，不伪造身份记录）以其原字符串按【当前】别名册重新解析，
+      但只用于资格判定——不回写旧记录（后续增补别名不追溯改变已提交意见）；
+    * 未登记姓名按原字符串比较；
+    * 同一原字符串必然同人（即使当前已归属某人员，也防止换用登记名绕过）。
+    返回命中的前序复核人信息；不重复返回 None。
+    """
+    for row in prior_rows:
+        prior_name = row["reviewer"]
+        if current.name == prior_name:
+            return {"seq": row["seq"], "review_no": row["review_no"], "reviewer": prior_name,
+                    "basis": "复核人标识原字符串相同"}
+        if row["reviewer_person_pk"] is not None:
+            prior_pk: int | None = row["reviewer_person_pk"]
+            prior_pid = row["reviewer_person_id"]
+        else:
+            prior_now = resolve_name(prior_name, aliases)
+            prior_pk = prior_now.person_pk
+            prior_pid = prior_now.person_id
+        if current.registered and prior_pk is not None and current.person_pk == prior_pk:
+            return {"seq": row["seq"], "review_no": row["review_no"], "reviewer": prior_name,
+                    "person_id": prior_pid,
+                    "basis": "按提交时别名归属属于同一人员（历史别名命中）"}
+    return None
+
+
 def submit_review(conn: sqlite3.Connection, dossier_id: str, data: ReviewIn) -> tuple[dict[str, Any], bool]:
     """提交一次复核/裁决。返回 (提交结果视图, 是否幂等重试)。
 
@@ -417,6 +527,11 @@ def submit_review(conn: sqlite3.Connection, dossier_id: str, data: ReviewIn) -> 
              "stored_digest": dossier["digest"]},
         )
 
+    # 本次提交时的别名归属快照：两人互异、第三人资格与回避检查均按此刻归属判定；
+    # 未登记姓名只解析为原字符串（person_pk=None）。
+    aliases = alias_map(conn)
+    reviewer_ident = resolve_name(data.reviewer, aliases)
+
     # 3) 阶段判定（基于事务内已提交状态；IMMEDIATE 串行，并发按已提交状态判定）
     reviews = _existing_reviews(conn, case_row["id"]) if case_row is not None else []
     if case_row is not None and case_row["finalized_at"] is not None:
@@ -442,15 +557,19 @@ def submit_review(conn: sqlite3.Connection, dossier_id: str, data: ReviewIn) -> 
     if n_reviews < 2:
         kind = KIND_REVIEW
         seq = n_reviews + 1
-        # 重复复核人：两名复核人必须不同（同一复核人不得提交两次）
-        prior_reviewers = {r["reviewer"] for r in reviews if r["kind"] == KIND_REVIEW}
-        if data.reviewer in prior_reviewers:
+        # 重复复核人：两名复核人必须不同。资格按本次提交时的别名归属判定：
+        # 已登记按归属人员（任一别名同一人即重复）；未登记姓名按原字符串比较。
+        prior_rows = [r for r in reviews if r["kind"] == KIND_REVIEW]
+        duplicate = _find_duplicate_reviewer(conn, aliases, reviewer_ident, prior_rows)
+        if duplicate is not None:
             raise DomainError(
                 409,
                 "duplicate_reviewer",
-                f"复核人 {data.reviewer} 已提交过该案卷的独立复核，两名复核人必须不同",
-                {"dossier_id": dossier_id, "reviewer": data.reviewer,
-                 "prior_reviewers": sorted(prior_reviewers)},
+                f"复核人 {data.reviewer} 与已提交复核人 {duplicate['reviewer']} 为同一人"
+                f"（{duplicate['basis']}），两名复核人必须不同",
+                {"dossier_id": dossier_id,
+                 "reviewer": reviewer_ident.as_dict(),
+                 "prior_reviewer": duplicate},
             )
         issues = _validate_full_list(data, item_rows)
         if issues:
@@ -460,20 +579,27 @@ def submit_review(conn: sqlite3.Connection, dossier_id: str, data: ReviewIn) -> 
                 "独立复核清单必须恰好覆盖卷内每份样本（不缺项、不重复份项、不越卷），整单拒绝且不留记录",
                 {"dossier_id": dossier_id, "items": issues},
             )
+        # 回避检查：前两次独立复核按封存案卷全部份项（命中任一份即整单拒绝）
+        _enforce_conflict_of_interest(
+            data, reviewer_ident, aliases, item_rows, None,
+            kind=KIND_REVIEW, dossier_id=dossier_id,
+        )
     else:
         # 前两份已到齐 → 仅允许第三人裁决
         kind = KIND_ADJUDICATION
         seq = 3
         r1 = next(r for r in reviews if r["seq"] == 1)
         r2 = next(r for r in reviews if r["seq"] == 2)
-        prior_reviewers = {r1["reviewer"], r2["reviewer"]}
-        if data.reviewer in prior_reviewers:
+        duplicate = _find_duplicate_reviewer(conn, aliases, reviewer_ident, [r1, r2])
+        if duplicate is not None:
             raise DomainError(
                 409,
                 "duplicate_reviewer",
-                f"裁决人 {data.reviewer} 参与过该案卷的前两次复核，分歧份项只允许未参与前两次复核的第三人裁决",
-                {"dossier_id": dossier_id, "reviewer": data.reviewer,
-                 "prior_reviewers": sorted(prior_reviewers)},
+                f"裁决人 {data.reviewer} 与前序复核人 {duplicate['reviewer']} 为同一人"
+                f"（{duplicate['basis']}），分歧份项只允许未参与前两次复核的第三人裁决",
+                {"dossier_id": dossier_id,
+                 "reviewer": reviewer_ident.as_dict(),
+                 "prior_reviewer": duplicate},
             )
         disputed = _disputed_samples(conn, r1["id"], r2["id"], item_rows)
         if not disputed:
@@ -492,6 +618,11 @@ def submit_review(conn: sqlite3.Connection, dossier_id: str, data: ReviewIn) -> 
                 {"dossier_id": dossier_id, "items": issues,
                  "disputed_samples": sorted(disputed)},
             )
+        # 回避检查：第三人裁决仅按分歧份项（命中任一争议份即整单拒绝）
+        _enforce_conflict_of_interest(
+            data, reviewer_ident, aliases, item_rows, disputed,
+            kind=KIND_ADJUDICATION, dossier_id=dossier_id,
+        )
 
     # 4) 全部校验通过后才写入（复核案惰性创建；头、提交、逐份意见同一事务）。
     created_at = utcnow_iso()
@@ -507,9 +638,14 @@ def submit_review(conn: sqlite3.Connection, dossier_id: str, data: ReviewIn) -> 
 
     try:
         rc = conn.execute(
-            "INSERT INTO review (case_pk, review_no, seq, kind, reviewer, request_hash, created_at)"
-            " VALUES (?,?,?,?,?,?,?)",
-            (case_pk, data.review_no, seq, kind, data.reviewer, request_hash, created_at),
+            "INSERT INTO review"
+            " (case_pk, review_no, seq, kind, reviewer,"
+            "  reviewer_person_pk, reviewer_person_id, reviewer_matched_alias,"
+            "  request_hash, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (case_pk, data.review_no, seq, kind, data.reviewer,
+             reviewer_ident.person_pk, reviewer_ident.person_id, reviewer_ident.matched_alias,
+             request_hash, created_at),
         )
     except sqlite3.IntegrityError:
         # 并发兜底：唯一键竞争（同 seq/同复核人/同复核单号）→ 按已提交状态拒绝，事务回滚

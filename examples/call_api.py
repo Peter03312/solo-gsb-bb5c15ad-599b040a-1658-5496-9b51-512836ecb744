@@ -9,6 +9,7 @@
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -463,6 +464,77 @@ def main() -> None:
         for o in it["opinions"]:
             print(f"      seq{o['seq']} {o['kind']:<12} {o['reviewer']}: "
                   f"{'通过' if o['passed'] else '不通过'} {o['reason'] or ''}")
+
+    # 16) 人员标识 / 历史别名登记 + 质控复核回避（本轮新增）
+    print("\n=== 人员标识、历史别名与复核回避 ===")
+    # 16.1) 登记人员（person_id 唯一，起始别名可多个；别名不得归属多人或转移）
+    pid_collector = f"PID-COL-{run_id}"
+    pid_qc = f"PID-QC-{run_id}"
+    s, r = call("POST", "/persons", {
+        "person_id": pid_collector,
+        "aliases": [f"采集员-{run_id}", f"老王-{run_id}"]})
+    print(f"登记采集人员 [HTTP {s}] revision={r['person']['revision']} 别名={[a['alias'] for a in r['person']['aliases']]}")
+    collector_name = f"采集员-{run_id}"
+    carrier_name = f"运输员-{run_id}"
+
+    # 同 person_id 同别名集合重试 → 200 幂等；别名归属他人 → 409 alias_conflict
+    s, r = call("POST", "/persons", {"person_id": pid_collector,
+                                     "aliases": [f"老王-{run_id}", f"采集员-{run_id}"]})
+    print(f"同人员同别名集合重试 [HTTP {s}] idempotent={r.get('idempotent')}")
+    s, r = call("POST", "/persons", {"person_id": f"PID-OTHER-{run_id}",
+                                     "aliases": [collector_name]})
+    print("别名归属他人:", s, r.get("error", {}).get("code"))
+
+    # 16.2) 增补别名必须携带所见修订号（过期 → 409 person_revision_stale）
+    s, r = call("POST", f"/persons/{pid_collector}/aliases",
+                {"alias": f"曾用名-{run_id}", "expected_revision": 99})
+    print("过期修订号增补:", s, r.get("error", {}).get("code"))
+    s, r = call("POST", f"/persons/{pid_collector}/aliases",
+                {"alias": f"曾用名-{run_id}", "expected_revision": 1})
+    print(f"正确修订号增补 [HTTP {s}] 新 revision={r['person']['revision']}")
+
+    # 登记无利害复核人与运输员（运输员会参与其中一份样本）
+    call("POST", "/persons", {"person_id": pid_qc, "aliases": [f"质控员-{run_id}"]})
+    call("POST", "/persons", {"person_id": f"PID-CAR-{run_id}", "aliases": [carrier_name]})
+
+    # 身份解析：已登记 → person_id；未登记 → registered=false（按原字符串）
+    qs = urllib.parse.urlencode([("names", f"曾用名-{run_id}"), ("names", "查无此人")])
+    s, r = call("GET", f"/identities/resolve?{qs}")
+    print(f"身份解析 [HTTP {s}]:", [(i["name"], i["person_id"], i["registered"]) for i in r["items"]])
+
+    # 16.3) 造两份样本并封存：第一份采集人=该登记人员，第二份采集人无关
+    coi1, coi2 = f"COI-A-{run_id}", f"COI-B-{run_id}"
+    for c_code, c_who, c_to in [(coi1, collector_name, carrier_name),
+                                (coi2, f"无关采集-{run_id}", f"无关运输-{run_id}")]:
+        call("POST", "/samples", {"sample_code": c_code,
+              "collected_at": "2026-09-30T01:00:00Z", "collector": c_who,
+              "seal_no": f"SEAL-{c_code}"})
+        call("POST", "/events", {"event_id": f"{c_code}-T1", "event_type": "transfer",
+              "sample_code": c_code, "occurred_at": "2026-09-30T02:00:00Z",
+              "transfer_no": f"TR-{c_code}", "from_custodian": c_who, "to_custodian": c_to})
+    coi_dossier = f"API-COI-DOS-{run_id}"
+    s, r = call("POST", "/dossiers", {"dossier_id": coi_dossier,
+                "items": [{"sample_code": coi1}, {"sample_code": coi2}]})
+    coi_digest = r["dossier"]["digest"]
+
+    # 16.4) 复核人用【增补后的历史别名】提交 → 命中自己采集的份项，整单 422，不占复核单号
+    coi_review_no = f"API-COI-RV-{run_id}"
+    s, r = call("POST", f"/dossiers/{coi_dossier}/reviews", {
+        "review_no": coi_review_no, "reviewer": f"曾用名-{run_id}",
+        "expected_digest": coi_digest,
+        "items": [{"sample_code": coi1, "passed": True},
+                  {"sample_code": coi2, "passed": True}]})
+    print("用历史别名复核自己参与的案卷:", s, r.get("error", {}).get("code"))
+    print("  命中份项:", [(h["sample_code"], h["role"], h["name"]) for h in r["error"]["details"]["items"]])
+
+    # 失败不占用复核单号：无利害复核人用同一单号可成功
+    s, r = call("POST", f"/dossiers/{coi_dossier}/reviews", {
+        "review_no": coi_review_no, "reviewer": f"质控员-{run_id}",
+        "expected_digest": coi_digest,
+        "items": [{"sample_code": coi1, "passed": True},
+                  {"sample_code": coi2, "passed": True}]})
+    print(f"同一单号改由无利害复核人提交 [HTTP {s}] seq={r.get('submission', {}).get('seq')}",
+          "身份归属:", r.get("submission", {}).get("reviewer_identity"))
 
 
 if __name__ == "__main__":
