@@ -225,3 +225,38 @@ class ReviewIn(BaseModel):
         description="提交方持有的案卷封存摘要（SHA-256，64 位十六进制）；与库存不一致则拒绝写入",
     )
     items: list[ReviewItemIn] = Field(..., min_length=1, description="逐份样本意见（前两次须完整覆盖案卷清单）")
+
+
+class PersonIn(BaseModel):
+    """人员标识登记：全局唯一主标识 + 可选初始历史别名。
+
+    * 主标识与全部别名构成全局唯一命名空间：任何名称只归属一人，
+      别名不得归属多人、不得转移归属；
+    * 登记成功后修订号为 1；事后增补别名须走别名接口并携带所见修订号；
+    * 同主标识同内容（含初始别名集合，顺序不敏感）重试幂等，异内容冲突。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    person_id: str = Field(..., min_length=1, description="人员标识（主标识，全局唯一）")
+    aliases: list[str] = Field(default_factory=list, description="初始历史别名（可空，事后可经修订号增补）")
+
+    @model_validator(mode="after")
+    def _check_aliases(self) -> "PersonIn":
+        for a in self.aliases:
+            if not a or not a.strip():
+                raise ValueError("初始别名不得为空或纯空白")
+            if a == self.person_id:
+                raise ValueError(f"初始别名 {a} 与人员主标识相同，无需重复登记")
+        if len(set(self.aliases)) != len(self.aliases):
+            raise ValueError("初始别名列表存在重复项")
+        return self
+
+
+class AliasIn(BaseModel):
+    """增补历史别名：须携带所见修订号（GET 人员信息取得），过期（与当前修订号不一致）则拒绝。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    alias: str = Field(..., min_length=1, description="待增补的历史别名（全局唯一，不得归属多人或转移）")
+    expected_revision: int = Field(..., ge=1, description="所见修订号；与人员当前修订号不一致（过期）则拒绝")

@@ -127,6 +127,7 @@ CREATE TABLE IF NOT EXISTS review (
     seq           INTEGER NOT NULL,                    -- 提交次序：1/2 独立复核，3 第三人裁决
     kind          TEXT NOT NULL CHECK (kind IN ('review','adjudication')),
     reviewer      TEXT NOT NULL,                       -- 复核人标识（前两份须不同，第三人须未参与前两次）
+    reviewer_person_id TEXT,                           -- 提交时解析的人员标识归属（NULL=未登记/升级前旧意见，不伪造）
     request_hash  TEXT NOT NULL,                       -- 请求指纹（同复核单号幂等/冲突判定）
     created_at    TEXT NOT NULL,
     UNIQUE (case_pk, seq),
@@ -144,10 +145,29 @@ CREATE TABLE IF NOT EXISTS review_opinion (
     UNIQUE (review_pk, sample_code)
 );
 
+-- 人员标识与历史别名（质控复核回避）：人员以全局唯一主标识登记，可登记/增补
+-- 历史别名；主标识与全部别名构成全局唯一命名空间——别名不得归属多人、不得
+-- 转移归属（不提供删除/转移）。增补别名须携带所见修订号（过期拒绝）。
+CREATE TABLE IF NOT EXISTS person (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id     TEXT NOT NULL UNIQUE,                -- 人员标识（主标识，全局唯一）
+    revision      INTEGER NOT NULL,                    -- 修订号：登记为 1，每次成功增补别名 +1
+    request_hash  TEXT NOT NULL,                       -- 登记请求指纹（同标识幂等/冲突判定）
+    created_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS person_alias (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_pk   INTEGER NOT NULL REFERENCES person(id),
+    alias       TEXT NOT NULL UNIQUE,                  -- 别名全局唯一：不得归属多人、不得转移
+    created_at  TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_event_sample_time ON custody_event(sample_id, occurred_at, id);
 CREATE INDEX IF NOT EXISTS idx_version_sample ON sample_version(sample_id, version);
 CREATE INDEX IF NOT EXISTS idx_review_case_dossier ON review_case(dossier_pk);
 CREATE INDEX IF NOT EXISTS idx_review_opinion_review ON review_opinion(review_pk, item_index);
+CREATE INDEX IF NOT EXISTS idx_person_alias_person ON person_alias(person_pk);
 """
 
 # 依赖迁移新列的索引（须在旧库补列迁移完成后再创建）
@@ -165,6 +185,9 @@ _MIGRATION_COLUMNS = {
         ("superseded_by", "TEXT"),
         ("replaces_event_id", "TEXT"),
         ("batch_id", "TEXT"),
+    ],
+    "review": [
+        ("reviewer_person_id", "TEXT"),                # 升级前旧意见保持 NULL，不伪造身份记录
     ],
 }
 

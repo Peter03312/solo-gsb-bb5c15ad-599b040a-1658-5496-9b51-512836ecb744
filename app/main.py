@@ -9,8 +9,19 @@ from fastapi.responses import JSONResponse
 from . import config
 from .db import db_session, init_db, row_to_dict
 from .dossiers import get_dossier, submit_dossier, verify_dossier
+from .identities import add_alias, get_person, list_persons, register_person
 from .reviews import get_review, submit_review
-from .schemas import ApproveIn, CorrectionIn, DossierIn, EventIn, ReviewIn, SampleIn, TransferBatchIn
+from .schemas import (
+    AliasIn,
+    ApproveIn,
+    CorrectionIn,
+    DossierIn,
+    EventIn,
+    PersonIn,
+    ReviewIn,
+    SampleIn,
+    TransferBatchIn,
+)
 from .service import (
     DomainError,
     approve_storage,
@@ -45,8 +56,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="样本交接链核验服务",
-    description="环境检测机构样本保管链（Chain of Custody）登记、事件核验、入库核定与版本化复核",
-    version="1.5.0",
+    description="环境检测机构样本保管链（Chain of Custody）登记、事件核验、入库核定、版本化复核与人员标识复核回避",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -296,6 +307,10 @@ def submit_review_api(dossier_id: str, data: ReviewIn) -> JSONResponse:
     * 前两份由两名不同复核人各提交一次覆盖卷内每份样本的完整清单，意见提交后不可改；
     * 逐份意见一致即终局，分歧份项仅允许未参与前两次复核的第三人裁决；
     * 全部份项终局后形成案卷结论，任一份不通过则案卷不通过；
+    * 利益冲突回避：复核人（及其登记别名）命中封存份项的采集/移交/签收/核定参与人
+      → 409 review_recusal 整单拒绝（两人复核按全部份项、第三人裁决按分歧份项检查）；
+    * 复核人互异与第三人资格按本次提交时的人员标识/别名归属判定；
+      成功意见记录当时的人员归属（person_id）供查询；
     * 同复核单号同内容重试 → 200 幂等返回原结果；异内容 → 409 review_conflict；
     * 缺项 / 重复份项 / 重复复核人 / 越阶段提交拒绝且不留部分记录；
     * 并发提交由 BEGIN IMMEDIATE 串行，按已提交状态判定。
@@ -308,6 +323,50 @@ def submit_review_api(dossier_id: str, data: ReviewIn) -> JSONResponse:
 
 @app.get(f"{API_PREFIX}/dossiers/{{dossier_id}}/reviews", tags=["reviews"])
 def get_review_api(dossier_id: str) -> dict[str, Any]:
-    """案卷复核查询：复核进度、原始意见、分歧对照与终局结论（含逐份状态）。"""
+    """案卷复核查询：复核进度、原始意见（含提交时人员归属）、分歧对照与终局结论（含逐份状态）。"""
     with db_session() as conn:
         return get_review(conn, dossier_id)
+
+
+# --------------------------------------------------------------------------- 人员标识与历史别名（复核回避）
+
+@app.post(f"{API_PREFIX}/persons", tags=["identities"], status_code=201)
+def register_person_api(data: PersonIn) -> JSONResponse:
+    """登记人员标识（主标识 + 可选初始历史别名）。
+
+    * 主标识与全部别名构成全局唯一命名空间：任何名称只归属一人，
+      别名不得归属多人、不得转移归属；
+    * 登记成功后修订号为 1；同主标识同内容（含初始别名集合）重试 → 200 幂等，
+      异内容 → 409 person_conflict；名称已被占用 → 409 alias_conflict。
+    """
+    with db_session(immediate=True) as conn:
+        person, idempotent = register_person(conn, data)
+    return JSONResponse(status_code=200 if idempotent else 201,
+                        content={"person": person, "idempotent": idempotent})
+
+
+@app.get(f"{API_PREFIX}/persons", tags=["identities"])
+def list_persons_api() -> dict[str, Any]:
+    """全部已登记人员：主标识、当前修订号与全部别名。"""
+    with db_session() as conn:
+        return list_persons(conn)
+
+
+@app.get(f"{API_PREFIX}/persons/{{person_id}}", tags=["identities"])
+def get_person_api(person_id: str) -> dict[str, Any]:
+    """人员查询：主标识、当前修订号（增补别名时须携带）与全部别名。"""
+    with db_session() as conn:
+        return {"person": get_person(conn, person_id)}
+
+
+@app.post(f"{API_PREFIX}/persons/{{person_id}}/aliases", tags=["identities"], status_code=201)
+def add_alias_api(person_id: str, data: AliasIn) -> dict[str, Any]:
+    """增补历史别名：须携带所见修订号（expected_revision）。
+
+    * 与人员当前修订号不一致（过期）→ 409 identity_revision_stale；
+    * 别名已归属任何人（含本人、含任何主标识）→ 409 alias_conflict；
+    * 成功：别名落库且修订号 +1；并发按 BEGIN IMMEDIATE 串行后的已提交修订号判定。
+    """
+    with db_session(immediate=True) as conn:
+        person = add_alias(conn, person_id, data)
+    return {"person": person}

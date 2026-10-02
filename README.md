@@ -1,6 +1,6 @@
 # 样本交接链核验服务（Chain of Custody）
 
-面向环境检测机构的样本保管链核验服务：登记样本采集信息，接收**移交 / 签收 / 封签检查 / 实验室入库**四类带唯一事件号的事件，自动按发生时间重算证据链，输出**当前保管人**与 **有效（valid）/ 待补证（pending）/ 无效（invalid）**结论及原因；同一交接车次的多份样本支持**批量移交一次提交**（全局唯一批次号、统一移交时间/交出人/接收人，整批原子、同号幂等）；核定入库前支持对当前有效事件提交**作废 / 替换纠错**（永久留痕、仅有效版本参与核验）；仅有效链可核定入库，核定后历史冻结；全部真正提交按先后形成**不可变版本**，质控可按样本编号 + 版本号复核任一历史版本的结论、原因、保管人、有效时间线、纠错与核定信息（版本 0 起，核定后旧版仍可查）；同一抽检的多份样本可**封存为案卷**（至少两份、可逐份指定历史版本、整卷原子、按样本编号排序清单 + 完整快照 + 可复算 SHA-256 摘要，封存后任何写入不改变旧案卷）；质控对已封存案卷作**双人独立复核**（提交须核对案卷摘要，摘要不一致拒绝写入；两名不同复核人各提交一次完整清单，意见不可改；逐份意见一致即终局，分歧份项只允许未参与前两次复核的第三人裁决，全部份项终局后形成案卷结论，任一份不通过则案卷不通过）。
+面向环境检测机构的样本保管链核验服务：登记样本采集信息，接收**移交 / 签收 / 封签检查 / 实验室入库**四类带唯一事件号的事件，自动按发生时间重算证据链，输出**当前保管人**与 **有效（valid）/ 待补证（pending）/ 无效（invalid）**结论及原因；同一交接车次的多份样本支持**批量移交一次提交**（全局唯一批次号、统一移交时间/交出人/接收人，整批原子、同号幂等）；核定入库前支持对当前有效事件提交**作废 / 替换纠错**（永久留痕、仅有效版本参与核验）；仅有效链可核定入库，核定后历史冻结；全部真正提交按先后形成**不可变版本**，质控可按样本编号 + 版本号复核任一历史版本的结论、原因、保管人、有效时间线、纠错与核定信息（版本 0 起，核定后旧版仍可查）；同一抽检的多份样本可**封存为案卷**（至少两份、可逐份指定历史版本、整卷原子、按样本编号排序清单 + 完整快照 + 可复算 SHA-256 摘要，封存后任何写入不改变旧案卷）；质控对已封存案卷作**双人独立复核**（提交须核对案卷摘要，摘要不一致拒绝写入；两名不同复核人各提交一次完整清单，意见不可改；逐份意见一致即终局，分歧份项只允许未参与前两次复核的第三人裁决，全部份项终局后形成案卷结论，任一份不通过则案卷不通过）；支持**人员标识与历史别名登记**（别名全局唯一、不得转移归属，增补须携带所见修订号），复核提交时自动做**利益冲突回避**（复核人及其别名命中封存份项的采集/移交/签收/核定参与人即整单拒绝），成功意见记录当时身份归属供查询。
 
 技术栈：**Python 3.11 + FastAPI + SQLite（标准库 sqlite3）**，无外部服务依赖。
 
@@ -31,6 +31,8 @@
 | 案卷双人复核 | 已封存案卷由**两名不同复核人**各提交一次**完整清单**（全局唯一**复核单号**、复核人标识、卷内每份样本的通过/不通过及不通过原因）。提交必须携带案卷封存**摘要**，与库存不一致 → **拒绝写入**（`review_digest_mismatch`）；复核只依据案卷封存的版本快照。清单须**恰好覆盖**卷内每份样本：缺项 / 重复份项 / 未知份项、重复复核人 → **拒绝且不留部分记录**（422/409）。两份意见逐份一致即该份**终局**（均不通过须原因文本也一致）；结论分歧或不通过原因分歧的份项 → 待裁决 |
 | 第三人裁决 | 有分歧的份项**只允许未参与前两次复核的第三人**裁决：裁决人若是前两名复核人之一 → 409；裁决清单须**恰好覆盖**截止提交时的全部分歧份项（漏裁、重复、裁决非分歧份项 → 422 不留记录）。全部份项终局后才形成案卷结论：**任一份终局不通过则案卷不通过**。意见提交后**不可改**；案卷终局后再提交 → 409 越阶段 |
 | 复核幂等/并发 | 同复核单号同内容重试 → 200 返回原结果（items 顺序不敏感）；同复核单号异内容（含跨案卷）→ 409 `review_conflict`。写事务 `BEGIN IMMEDIATE` 串行：并发提交按已提交状态判定（次序 seq、复核人资格、所处阶段均以已提交数据为准，唯一键兜底）；任何失败事务回滚，不留下复核案/提交/逐份意见的部分记录 |
+| 人员标识与别名 | 人员以全局唯一**主标识**登记，可登记初始别名、事后**增补历史别名**；主标识与全部别名构成全局唯一命名空间——**别名不得归属多人、不得转移归属**（不提供删除/转移）；增补别名须携带**所见修订号**（登记为 1，每次成功增补 +1），过期（与当前不一致）→ 409 `identity_revision_stale`；同标识同内容登记幂等（200）、异内容冲突（409 `person_conflict`）、名称已占用（409 `alias_conflict`） |
+| 复核利益冲突回避 | **两人复核按封存案卷全部份项、第三人裁决按分歧份项**，在提交事务中以**封存版本的采集人、有效事件中移交和签收的参与人、核定人**检查复核人及其别名；**命中任一份即整单拒绝**（409 `review_recusal`，明细列出份项和命中角色，**不占复核单号**、不留记录）；未登记姓名按原字符串比较；两人互异及第三人资格按**本次提交时**的别名归属判定；成功意见记录当时的身份归属（`person_id`）供查询，后续增补别名不追溯改变已提交意见，升级前旧意见不伪造身份记录（`person_id` 为 null） |
 
 > 说明：任何事件发生时间早于样本采集时间，直接记为无效（采集前不可能发生保管动作）。
 
@@ -564,6 +566,15 @@ curl -X POST http://localhost:8080/api/v1/dossiers/DOSSIER-20261001-01/verify
 
 意见一旦提交**不可改**；无分歧时无需裁决，案卷在第二份提交时直接终局。
 
+**利益冲突回避（防止参与样本保管的人评价自己的案卷）**：每次提交在事务内额外检查复核人（及其登记别名，见 5.10）是否参与了受审份项的保管——
+
+- **检查范围**：两人复核（seq 1/2）按封存案卷**全部份项**；第三人裁决（seq 3）按**分歧份项**；
+- **检查对象**：封存版本快照中的**采集人**（`collector`）、**有效事件**中移交的交出方/接收方（`transfer_from`/`transfer_to`）与签收的签收人（`receiver`）、**核定人**（`approver`）；
+- **判定**：复核人姓名解析到已登记人员（主标识或别名）后与参与人按人员归属比较；**未登记姓名按原字符串比较**；
+- **命中任一份即整单拒绝**：409 `review_recusal`，明细列出命中份项与角色，**不占复核单号**、不留任何记录（修正复核人后可复用同一单号）；
+- 两名复核人互异、第三人资格均按**本次提交时**的别名归属判定（同一人换用主标识/别名提交同样拒绝）；
+- 成功提交的意见记录**当时解析的人员归属**（`person_id`）供查询；后续增补别名不追溯改变已提交意见，升级前的旧意见不伪造身份记录（`person_id` 为 `null`）。
+
 #### 提交复核 / 裁决
 
 `POST /api/v1/dossiers/{dossier_id}/reviews`
@@ -611,6 +622,7 @@ curl -X POST http://localhost:8080/api/v1/dossiers/DOSSIER-20261001-01/reviews \
     "seq": 1,
     "kind": "review",
     "reviewer": "QC-1001 质控员甲",
+    "person_id": "QC-1001",
     "submitted_at": "2026-10-01T03:00:00Z",
     "items": [
       {"sample_code": "S-001", "passed": true, "reason": null},
@@ -622,6 +634,7 @@ curl -X POST http://localhost:8080/api/v1/dossiers/DOSSIER-20261001-01/reviews \
 ```
 
 - 第三人裁决提交 `seq=3`、`kind=adjudication`，`items` 仅含本次裁决的分歧份项。
+- `submission.person_id` 为本次提交时复核人解析到的人员标识（未登记为 `null`）；后续增补别名不改变该记录。
 - 全部份项终局的那次提交，`review.stage=completed` 且 `review.conclusion` 固化；**终局结论在事务内一次形成，不随后续请求变化**。
 
 #### 复核进度 / 原始意见 / 分歧 / 终局查询
@@ -646,9 +659,9 @@ curl http://localhost:8080/api/v1/dossiers/DOSSIER-20261001-01/reviews
   "pending_item_count": 0,
   "all_items_final": true,
   "reviewers": [
-    {"seq": 1, "kind": "review",       "reviewer": "QC-1001 质控员甲", "review_no": "REV-…-001", "submitted_at": "…"},
-    {"seq": 2, "kind": "review",       "reviewer": "QC-1002 质控员乙", "review_no": "REV-…-002", "submitted_at": "…"},
-    {"seq": 3, "kind": "adjudication", "reviewer": "QC-2009 质控主管丙", "review_no": "REV-…-003", "submitted_at": "…"}
+    {"seq": 1, "kind": "review",       "reviewer": "QC-1001 质控员甲", "person_id": "QC-1001", "review_no": "REV-…-001", "submitted_at": "…"},
+    {"seq": 2, "kind": "review",       "reviewer": "QC-1002 质控员乙", "person_id": "QC-1002", "review_no": "REV-…-002", "submitted_at": "…"},
+    {"seq": 3, "kind": "adjudication", "reviewer": "QC-2009 质控主管丙", "person_id": "QC-2009", "review_no": "REV-…-003", "submitted_at": "…"}
   ],
   "items": [
     {
@@ -658,9 +671,9 @@ curl http://localhost:8080/api/v1/dossiers/DOSSIER-20261001-01/reviews
       "status": "final",
       "opinions": [
         {"seq": 1, "kind": "review", "review_no": "REV-…-001", "reviewer": "QC-1001 质控员甲",
-         "passed": true, "reason": null, "submitted_at": "…"},
+         "person_id": "QC-1001", "passed": true, "reason": null, "submitted_at": "…"},
         {"seq": 2, "kind": "review", "review_no": "REV-…-002", "reviewer": "QC-1002 质控员乙",
-         "passed": true, "reason": null, "submitted_at": "…"}
+         "person_id": "QC-1002", "passed": true, "reason": null, "submitted_at": "…"}
       ],
       "disagreement": null,
       "final": {"passed": true, "reason": null, "source": "agreement"}
@@ -696,7 +709,7 @@ curl http://localhost:8080/api/v1/dossiers/DOSSIER-20261001-01/reviews
 |---|---|
 | `stage` | `awaiting_review`（无人提交）/ `first_reviewed`（仅第一份）/ `awaiting_adjudication`（两份齐、有分歧待裁决）/ `completed`（案卷结论已形成） |
 | `items[].status` | 逐份状态：`pending`（两份未齐）/ `disputed`（有分歧待裁决）/ `final`（已终局） |
-| `items[].opinions` | 该份全部**原始意见**（含 seq、kind、复核单号、复核人、通过与否、原因、提交时间）；一致份项两条，裁决份项三条，永久留痕 |
+| `items[].opinions` | 该份全部**原始意见**（含 seq、kind、复核单号、复核人、提交时人员归属 `person_id`、通过与否、原因、提交时间）；一致份项两条，裁决份项三条，永久留痕 |
 | `items[].disagreement` | 待裁决时给出分歧类型（`pass_conflict` 结论分歧 / `reason_conflict` 不通过原因分歧）与两人意见对照；终局后为 `null`（原始意见仍在 `opinions` 可追溯） |
 | `items[].final.source` | 终局来源：`agreement`（两份一致；不通过时 `reason` 为共同原因）/ `adjudication`（第三人裁决；`reason` 为裁决原因） |
 | `disputed_samples` | 当前待裁决份项编号列表 |
@@ -710,7 +723,8 @@ curl http://localhost:8080/api/v1/dossiers/DOSSIER-20261001-01/reviews
 | `expected_digest` 与封存摘要不一致 | 422 | `review_digest_mismatch`（详情给两侧摘要；失败不占用复核单号） |
 | 前两次清单缺项 / 重复份项 / 未知份项 | 422 | `review_rejected`（明细 `missing_sample_in_review` / `duplicate_sample_in_review` / `unknown_sample_in_review`，逐项给出） |
 | 通过带原因 / 不通过无原因 | 422 | 请求体字段校验 |
-| 两名复核人相同；第三人是前两名之一 | 409 | `duplicate_reviewer` |
+| 两名复核人相同（含按别名归属为同一人）；第三人是前两名之一（含别名） | 409 | `duplicate_reviewer` |
+| 复核人（含其别名）命中受审份项的采集/移交/签收/核定参与人 | 409 | `review_recusal`（明细 `details.items` 列出份项与命中角色；不占复核单号） |
 | 裁决清单漏裁 / 重复 / 裁决非分歧份项 | 422 | `review_rejected`（明细 `missing_adjudication` / `duplicate_sample_in_review` / `adjudication_not_allowed`） |
 | 无分歧却提交裁决；案卷终局后再提交 | 409 | `review_stage_rejected`（越阶段） |
 | 同复核单号异内容（含跨案卷复用该单号） | 409 | `review_conflict` |
@@ -718,6 +732,64 @@ curl http://localhost:8080/api/v1/dossiers/DOSSIER-20261001-01/reviews
 
 - 所有失败均在写入前校验或整事务回滚，**不留下**复核案、提交记录或逐份意见的部分记录；失败的复核单号可复用。
 - 复核只读取案卷封存的快照与摘要，不影响案卷本身（`verify` 仍 `match=true`），也不影响任何样本版本。
+
+### 5.10 人员标识与历史别名（复核回避登记）
+
+质控复核回避依赖统一的人员登记：每名人员以**全局唯一主标识**登记，可登记初始历史别名、事后**增补历史别名**。主标识与全部别名构成**全局唯一命名空间**——任何名称只归属一人，**别名不得归属多人、不得转移归属**（不提供删除/转移）。复核提交时把复核人与案卷参与人解析到人员归属后比较；**未登记姓名按原字符串比较**。
+
+#### 登记人员
+
+`POST /api/v1/persons`
+
+```bash
+curl -X POST http://localhost:8080/api/v1/persons \
+  -H 'Content-Type: application/json' -d '{
+    "person_id":"QC-1001",
+    "aliases":["质控员甲","甲某"]
+  }'
+```
+
+- `201` 新建（`revision=1`）；同主标识同内容（含初始别名集合，顺序不敏感）重试 `200`（`idempotent: true`）；同主标识异内容 `409 person_conflict`。
+- 主标识或任一初始别名已被占用（他人主标识或别名）→ `409 alias_conflict`（明细给出归属人 `owner_person_id`）；初始别名重复或与主标识相同 → `422`（字段校验）。
+
+响应：
+
+```json
+{
+  "person": {
+    "person_id": "QC-1001",
+    "revision": 1,
+    "aliases": ["质控员甲", "甲某"],
+    "created_at": "2026-10-01T02:00:00Z"
+  },
+  "idempotent": false
+}
+```
+
+#### 增补历史别名（须携带所见修订号）
+
+`POST /api/v1/persons/{person_id}/aliases`
+
+```bash
+# 先 GET 取得当前修订号，再携带该修订号增补
+REV=$(curl -s http://localhost:8080/api/v1/persons/QC-1001 | python3 -c 'import sys,json;print(json.load(sys.stdin)["person"]["revision"])')
+curl -X POST http://localhost:8080/api/v1/persons/QC-1001/aliases \
+  -H 'Content-Type: application/json' -d "{\"alias\":\"王甲\",\"expected_revision\":$REV}"
+```
+
+- 成功 `201`：别名落库且 `revision +1`（响应返回最新人员视图）。
+- 所见修订号与当前不一致（过期，如并发增补后重试旧请求）→ `409 identity_revision_stale`（明细给 `expected_revision`/`current_revision`，重新查询后再试）。
+- 别名已归属任何人（含本人、含任何主标识）→ `409 alias_conflict`；人员不存在 → `404 person_not_found`。
+- 并发增补同一修订号：`BEGIN IMMEDIATE` 串行，按已提交修订号判定，仅一次成功。
+
+#### 查询
+
+| 方法与路径 | 说明 |
+|---|---|
+| `GET /api/v1/persons` | 全部已登记人员（主标识、当前修订号、全部别名） |
+| `GET /api/v1/persons/{person_id}` | 单人员查询（增补别名前取 `revision`）；不存在 → `404 person_not_found` |
+
+人员登记如何参与复核回避见 5.9「利益冲突回避」：复核人姓名命中任何已登记主标识/别名即按该人员归属判定；成功意见在 `reviewers[].person_id` 与 `items[].opinions[].person_id` 中记录提交时的归属供查询。
 
 ### 错误响应统一格式
 
@@ -744,9 +816,14 @@ curl http://localhost:8080/api/v1/dossiers/DOSSIER-20261001-01/reviews
 | 422 | `dossier_rejected` | 整卷失败：卷内样本编号重复（`duplicate_sample_in_dossier`，明细见 `details.items`）；样本/版本不存在分别按 `sample_not_found`/`version_not_found` 报 404，均不留案卷 |
 | 422 | `review_digest_mismatch` | 复核提交携带的案卷摘要与封存摘要不一致，拒绝写入（详情给两侧摘要） |
 | 422 | `review_rejected` | 复核/裁决清单不合法：缺项（`missing_sample_in_review`/`missing_adjudication`）、重复份项（`duplicate_sample_in_review`）、未知份项（`unknown_sample_in_review`）、裁决非分歧份项（`adjudication_not_allowed`）；逐项明细见 `details.items`，整单不留记录 |
-| 409 | `duplicate_reviewer` | 两名独立复核人相同，或第三人曾参与前两次复核 |
+| 409 | `duplicate_reviewer` | 两名独立复核人相同，或第三人曾参与前两次复核（均按提交时的人员标识/别名归属判定） |
+| 409 | `review_recusal` | 利益冲突回避：复核人（含其别名）命中受审份项的采集/移交/签收/核定参与人，整单拒绝（明细 `details.items` 列出份项与命中角色、`reviewer_person_id` 给出复核人归属；不占复核单号、不留记录） |
 | 409 | `review_stage_rejected` | 越阶段提交：无分歧时提交裁决、裁决/终局后再次提交（意见不可改） |
 | 409 | `review_conflict` | 同复核单号异内容（含跨案卷占用该单号），或并发竞争落败（按已提交状态判定） |
+| 404 | `person_not_found` | 人员查询/增补别名的人员标识不存在 |
+| 409 | `person_conflict` | 同人员标识异内容登记（同标识登记内容不一致） |
+| 409 | `alias_conflict` | 名称已归属他人（或本人）：别名不得归属多人、不得转移归属（明细给出 `owner_person_id`） |
+| 409 | `identity_revision_stale` | 增补别名携带的所见修订号已过期（明细给 `expected_revision`/`current_revision`） |
 
 ---
 
@@ -758,7 +835,7 @@ curl http://localhost:8080/api/v1/dossiers/DOSSIER-20261001-01/reviews
 python examples/call_api.py
 ```
 
-脚本依次演示：登记 → 移交 → 签收 → 封签检查 → 入库 → 幂等重试 → 冲突 → 查询证据链 → **纠错替换 / 同号幂等 / 链追溯 / 作废演示 / 纠错审计查询** → 核定 → 核定后改写与纠错被拒 → **批量移交提交 / 同号幂等 / 异内容冲突 / 整批失败 / 批次查询 / 批内作废后查询变化** → **保管链版本复核（版本索引、指定历史版本快照、当前最新版本、未知样本/版本报错）** → **案卷封存（指定/缺省版本封存、案卷查询、摘要核验、同号幂等重试、异内容冲突、整卷失败）** → **案卷双人独立复核（摘要核对、两份完整清单、重复复核人拒绝、分歧形成、第三人资格与清单校验、裁决终局、案卷不通过、同号幂等/异内容冲突、越阶段拒绝、复核查询）**。也可直接在 http://localhost:8080/docs 的 Swagger UI 中点击调用。
+脚本依次演示：登记 → 移交 → 签收 → 封签检查 → 入库 → 幂等重试 → 冲突 → 查询证据链 → **纠错替换 / 同号幂等 / 链追溯 / 作废演示 / 纠错审计查询** → 核定 → 核定后改写与纠错被拒 → **批量移交提交 / 同号幂等 / 异内容冲突 / 整批失败 / 批次查询 / 批内作废后查询变化** → **保管链版本复核（版本索引、指定历史版本快照、当前最新版本、未知样本/版本报错）** → **案卷封存（指定/缺省版本封存、案卷查询、摘要核验、同号幂等重试、异内容冲突、整卷失败）** → **案卷双人独立复核（摘要核对、两份完整清单、重复复核人拒绝、分歧形成、第三人资格与清单校验、裁决终局、案卷不通过、同号幂等/异内容冲突、越阶段拒绝、复核查询）** → **人员标识与复核回避（登记人员与初始别名、携带修订号增补别名、过期修订号拒绝、别名归属冲突、复核人别名命中采集/移交人整单拒绝、未登记核定人按原字符串命中、回避失败不占复核单号、意见身份归属查询）**。也可直接在 http://localhost:8080/docs 的 Swagger UI 中点击调用。
 
 版本复核也可用 curl 直接体验（完整脚本见下）：
 
@@ -794,6 +871,24 @@ curl -X POST http://localhost:8080/api/v1/dossiers/DOSSIER-001/reviews -H 'Conte
   \"items\":[{\"sample_code\":\"S-001\",\"passed\":false,\"reason\":\"维持不通过\"}]}"   # 第三人只裁决分歧份项
 ```
 
+人员标识与复核回避 curl 速览（登记人员 → 增补别名 → 命中回避 → 查询身份归属）：
+
+```bash
+# 登记人员（主标识 + 初始别名；同标识同内容重试幂等）
+curl -X POST http://localhost:8080/api/v1/persons -H 'Content-Type: application/json' -d '{
+  "person_id":"QC-1001","aliases":["质控员甲"]}'
+# 增补别名须携带所见修订号（先 GET 取得；过期 409 identity_revision_stale）
+REV=$(curl -s http://localhost:8080/api/v1/persons/QC-1001 | python3 -c 'import sys,json;print(json.load(sys.stdin)["person"]["revision"])')
+curl -X POST http://localhost:8080/api/v1/persons/QC-1001/aliases -H 'Content-Type: application/json' -d "{
+  \"alias\":\"王采集\",\"expected_revision\":$REV}"
+# 复核人 QC-1001（别名“王采集”是封存版本的采集人/移交人）提交 → 409 review_recusal，明细列出份项与命中角色
+curl -X POST http://localhost:8080/api/v1/dossiers/DOSSIER-001/reviews -H 'Content-Type: application/json' -d "{
+  \"review_no\":\"REV-004\",\"reviewer\":\"QC-1001\",\"expected_digest\":\"$DIG\",
+  \"items\":[{\"sample_code\":\"S-001\",\"passed\":true},{\"sample_code\":\"S-002\",\"passed\":true}]}"
+# 换无利益冲突的复核人可复用同一复核单号；成功意见在 reviewers/opinions 中记录 person_id
+curl http://localhost:8080/api/v1/dossiers/DOSSIER-001/reviews
+```
+
 ---
 
 ## 七、自测
@@ -805,6 +900,7 @@ python -m tests.test_batches        # 批量移交：83 项断言（含并发）
 python -m tests.test_versions       # 版本复核：94 项断言（含旧库迁移基线）
 python -m tests.test_dossiers       # 案卷封存：61 项断言（含并发与篡改核验）
 python -m tests.test_reviews        # 案卷双人复核：80 项断言（含并发）
+python -m tests.test_identities     # 人员标识与复核回避：67 项断言（含并发）
 ```
 
 - `test_chain` 覆盖 14 类场景：登记幂等/冲突、四类无效情形（非保管人移交、在途再移交、签收四要素不符、重复签收、封签不符/破损）、待补证两情形、乱序补录重算、核定准入与冻结、事件早于采集、无效优先等。
@@ -813,6 +909,7 @@ python -m tests.test_reviews        # 案卷双人复核：80 项断言（含并
 - `test_versions` 覆盖：登记即版本 0（快照字段）、单事件每次真正提交 +1 而同号重试/冲突失败不产生版本、快照不可变且补录较早事件不改旧版（版本按提交先后、时间线按发生时间重排）、批量移交各样本版本随事件同提交/整批失败全不增/幂等不增/失败批次号修正后复用、替换与作废纠错 +1 而幂等与对失效事件纠错不增、核定 +1 而核定被拒/重复核定/冻结后写入不增、核定后全部旧版仍可查、版本索引/`latest`/指定版本端点、未知样本与不存在/非数字/负数版本号报错、快照完整字段、旧库迁移为已有样本补建 `baseline` 版本 0 且幂等、迁移后版本从 1 继续。
 - `test_dossiers` 覆盖：基本封存（指定/缺省版本、清单按样本编号排序、快照与版本复核一致、摘要可独立复算）、整卷失败五类（编号重复/样本不存在/版本不存在/份数不足/负数版本）且不留案卷与案卷号可复用、同号同内容（含换序）幂等且最新版本变化后仍返回原卷、异内容 409、封存后补录/纠错/核定不改变旧案卷、核验一致/篡改报不一致且不静默改写、不存在案卷查询与核验 404、同号同内容并发一建一幂等、同号异内容并发一建一冲突且遵循已提交结果、既有版本与写入接口行为保持。
 - `test_reviews` 覆盖：未提交进度、摘要核对（不一致 422 且不留记录/不占复核单号）、两份完整清单校验（缺项/重复份项/未知份项 422 且不留部分记录、通过带原因/不通过无原因字段校验）、重复复核人 409（含换单号）、两份一致的通过/不通过终局（共同原因留痕、无分歧无需裁决）、结论分歧与不通过原因分歧识别、第三人资格（前两名禁止裁决）与裁决清单校验（漏裁/重复/裁决非分歧份项）、裁决终局与案卷不通过、原始意见/分歧对照/逐份终局/案卷结论查询、同复核单号同内容（含换序）200 幂等/异内容及跨案卷占用 409、终局后与无分歧时越阶段提交 409、不存在案卷 404、并发三场景（不同复核人各占一次序、同复核人仅一成、同号同内容一建一幂等）。
+- `test_identities` 覆盖：人员登记（同内容幂等/异内容冲突/名称占用/初始别名字段校验）、增补别名（所见修订号成功与过期拒绝、别名归属本人/他人/主标识冲突、未知人员 404、并发同修订号仅一次成功）、复核回避（采集人/移交人/接收人/签收人/核定人各角色命中、多份命中列全、未登记姓名按原字符串比较、不占复核单号且不留记录、两人复核按全部份项、第三人裁决按分歧份项）、两人互异与第三人资格按提交时别名归属判定、成功意见记录身份归属（person_id）且后续增补别名不追溯、未登记/旧意见不伪造身份记录、既有复核单号/摘要/幂等规则保持。
 
 ---
 
@@ -825,18 +922,20 @@ python -m tests.test_reviews        # 案卷双人复核：80 项断言（含并
 │   ├── service.py    # 核心领域逻辑：幂等指纹、保管链重算、纠错（作废/替换）、核定冻结、批量移交
 │   ├── versions.py   # 保管链版本：版本快照记录、版本 0 基线迁移、版本索引/指定版本查询
 │   ├── dossiers.py   # 案卷封存：整卷原子封存、按编号排序清单、SHA-256 摘要与核验、同号幂等/冲突
-│   ├── reviews.py    # 案卷双人独立复核：摘要核对、两份完整清单、分歧识别、第三人裁决、终局结论与查询
-│   ├── schemas.py    # 请求模型：事件、纠错（NewEventIn/CorrectionIn）、批量移交（TransferBatchIn）、案卷（DossierIn）、复核（ReviewIn）按类型必填校验
-│   ├── db.py         # SQLite 连接、建表与旧库迁移（批次表、版本表与基线补建、案卷表、复核案/意见表）、IMMEDIATE 事务
+│   ├── reviews.py    # 案卷双人独立复核：摘要核对、两份完整清单、分歧识别、第三人裁决、利益冲突回避、终局结论与查询
+│   ├── identities.py # 人员标识与历史别名：全局唯一命名空间、修订号增补、姓名→人员归属解析
+│   ├── schemas.py    # 请求模型：事件、纠错（NewEventIn/CorrectionIn）、批量移交（TransferBatchIn）、案卷（DossierIn）、复核（ReviewIn）、人员（PersonIn/AliasIn）按类型必填校验
+│   ├── db.py         # SQLite 连接、建表与旧库迁移（批次表、版本表与基线补建、案卷表、复核案/意见表、人员/别名表）、IMMEDIATE 事务
 │   ├── seed.py       # 演示数据初始化（幂等）
 │   └── config.py     # 环境变量配置
-├── examples/call_api.py   # 零依赖调用示例（含纠错、批量移交、版本复核、案卷封存与双人复核全流程）
+├── examples/call_api.py   # 零依赖调用示例（含纠错、批量移交、版本复核、案卷封存与双人复核、人员标识与复核回避全流程）
 ├── tests/test_chain.py    # 既有规则端到端自测（42 项断言）
 ├── tests/test_corrections.py  # 纠错端到端自测（65 项断言，含并发）
 ├── tests/test_batches.py  # 批量移交端到端自测（83 项断言，含并发）
 ├── tests/test_versions.py # 保管链版本复核端到端自测（94 项断言，含旧库迁移）
 ├── tests/test_dossiers.py # 案卷封存端到端自测（61 项断言，含并发与篡改核验）
 ├── tests/test_reviews.py  # 案卷双人复核端到端自测（80 项断言，含并发）
+├── tests/test_identities.py # 人员标识与复核回避端到端自测（67 项断言，含并发）
 ├── entrypoint.sh     # 容器入口：建表 → 演示数据 → 启动
 ├── Dockerfile
 ├── docker-compose.yml

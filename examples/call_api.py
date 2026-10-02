@@ -464,6 +464,86 @@ def main() -> None:
             print(f"      seq{o['seq']} {o['kind']:<12} {o['reviewer']}: "
                   f"{'通过' if o['passed'] else '不通过'} {o['reason'] or ''}")
 
+    # 16) 人员标识与历史别名 + 复核利益冲突回避（防止参与保管的人评价自己的案卷）
+    print("\n=== 人员标识与复核回避 ===")
+    # 16.1) 登记人员标识：全局唯一主标识 + 可选初始历史别名
+    qc_a = f"QC-A-{run_id}"
+    s, r = call("POST", "/persons", {"person_id": qc_a, "aliases": ["王采集"]})
+    show("登记人员（主标识 + 初始别名）", s, r, "person")
+    revision = r["person"]["revision"]
+
+    # 16.2) 增补历史别名：须携带所见修订号（GET 人员取得）；过期则拒绝
+    s, r = call("POST", f"/persons/{qc_a}/aliases",
+                {"alias": "采集老王", "expected_revision": revision})
+    print(f"增补别名（携带修订号 {revision}）[HTTP {s}] 新修订号={r['person']['revision']}")
+    s, r = call("POST", f"/persons/{qc_a}/aliases",
+                {"alias": "老王", "expected_revision": revision})  # 修订号已过期
+    print("过期修订号增补:", s, r.get("error", {}).get("code"),
+          "| 当前修订号:", r.get("error", {}).get("details", {}).get("current_revision"))
+
+    # 16.3) 别名不得归属多人/转移：另一人登记同一别名 → 409
+    qc_b = f"QC-B-{run_id}"
+    call("POST", "/persons", {"person_id": qc_b})
+    s, r = call("POST", f"/persons/{qc_b}/aliases",
+                {"alias": "王采集", "expected_revision": 1})
+    print("别名归属他人:", s, r.get("error", {}).get("code"),
+          "| 归属:", r.get("error", {}).get("details", {}).get("owner_person_id"))
+
+    # 16.4) 另封存一卷演示回避：code/code2 的采集人、移交人均为“王采集”，code 的核定人为“质量主管”
+    recusal_dossier_id = f"API-RECUSAL-DOS-{run_id}"
+    s, r = call("POST", "/dossiers", {
+        "dossier_id": recusal_dossier_id,
+        "items": [{"sample_code": code}, {"sample_code": code2}],
+    })
+    digest2 = r["dossier"]["digest"]
+    print(f"\n--- 回避演示案卷封存 [HTTP {s}] 摘要={digest2} ---")
+
+    # 复核人 QC-A 的别名“王采集”是封存版本的采集人/移交人 → 整单拒绝并列出份项与命中角色
+    s, r = call("POST", f"/dossiers/{recusal_dossier_id}/reviews", {
+        "review_no": f"API-RV-REC-{run_id}", "reviewer": qc_a,
+        "expected_digest": digest2,
+        "items": [{"sample_code": code, "passed": True},
+                  {"sample_code": code2, "passed": True}]})
+    print("复核人别名命中采集人/移交人:", s, r.get("error", {}).get("code"))
+    for it in r.get("error", {}).get("details", {}).get("items", []):
+        print(f"    命中份项 {it['sample_code']}: "
+              + ", ".join(f"{h['role']}={h['participant']}" for h in it["hits"]))
+
+    # 未登记姓名按原字符串比较：“质量主管”是 code 封存版本的核定人 → 同样拒绝
+    s, r = call("POST", f"/dossiers/{recusal_dossier_id}/reviews", {
+        "review_no": f"API-RV-REC2-{run_id}", "reviewer": "质量主管",
+        "expected_digest": digest2,
+        "items": [{"sample_code": code, "passed": True},
+                  {"sample_code": code2, "passed": True}]})
+    print("复核人是核定人（未登记按原字符串命中）:", s, r.get("error", {}).get("code"))
+
+    # 16.5) 回避失败不占复核单号：同一单号换无利益冲突的复核人可提交
+    qc_c = f"QC-C-{run_id}"
+    qc_d = f"QC-D-{run_id}"
+    call("POST", "/persons", {"person_id": qc_c})
+    call("POST", "/persons", {"person_id": qc_d})
+    s, r = call("POST", f"/dossiers/{recusal_dossier_id}/reviews", {
+        "review_no": f"API-RV-REC-{run_id}", "reviewer": qc_c,   # 复用被回避拒绝的单号
+        "expected_digest": digest2,
+        "items": [{"sample_code": code, "passed": True},
+                  {"sample_code": code2, "passed": True}]})
+    print(f"回避失败不占复核单号，换人提交 [HTTP {s}] person_id={r['submission']['person_id']}")
+
+    # 16.6) 第二人提交 → 案卷完成；意见记录提交时的身份归属供查询
+    s, r = call("POST", f"/dossiers/{recusal_dossier_id}/reviews", {
+        "review_no": f"API-RV-REC3-{run_id}", "reviewer": qc_d,
+        "expected_digest": digest2,
+        "items": [{"sample_code": code, "passed": True},
+                  {"sample_code": code2, "passed": True}]})
+    print(f"第二份独立复核 [HTTP {s}] stage={r['review']['stage']}")
+    s, r = call("GET", f"/dossiers/{recusal_dossier_id}/reviews")
+    print("复核人身份归属:", [(x["reviewer"], x["person_id"]) for x in r["reviewers"]])
+
+    # 16.7) 人员查询与列表
+    s, r = call("GET", f"/persons/{qc_a}")
+    print(f"\n--- 人员查询 [HTTP {s}] ---")
+    print(json.dumps(r["person"], ensure_ascii=False, indent=2))
+
 
 if __name__ == "__main__":
     main()
